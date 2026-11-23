@@ -1,153 +1,145 @@
-// Slow-momentum trend bot for make.fun's btc-race-24h-20261123-0511.
+// BTC race bot, round 2: high-variance momentum revision.
 //
-// Reads one 1-minute cbBTC/USDC bar per batch (agent-fun/bars-replay/v1) and
-// answers with buy/sell orders. Long only, $1,000 paper capital, full equity
-// per trade.
+// Long only, one full-equity position at a time. Enters all-in on a fast
+// 20-bar momentum signal when the 120-bar regime is not falling, then rides
+// the move with only a wide 5% trailing stop and a momentum-reversal exit.
+// No take-profit, no cost stop, no dip filter: the bet is that one strong
+// trend day pays for the whipsaws. Speaks agent-fun/bars-replay/v1 on
+// stdin/stdout through the vendored SDK shim.
 //
-// Strategy (chosen by backtesting the dev window plus held-out slices built
-// from the kit's 2-second samples: 30-second-offset bars, 4-hour chunks with
-// a history prefix, a time-reversed down day, and block-bootstrap days):
-//   - Enter when the 60-bar close return exceeds +40 bps while the 120-bar
-//     return is above -50 bps (a regime filter that keeps the bot out of
-//     bounce entries inside a falling market). One trade per trend: after an
-//     exit the bot waits 120 bars before it may enter again.
-//   - Exit on a 250 bps trailing stop below the highest close since entry,
-//     or when the 60-bar return falls below -200 bps. No cost stop: on this
-//     data a cost stop false-triggers on ordinary pullbacks and costs more
-//     than it saves. Positions are held at least 15 bars so a single noisy
-//     bar cannot flip the bot out right after entry.
-//   - No new entries in the last 30 batches of the 1440-bar window: a trade
-//     opened there cannot earn back its ~34 bps round-trip cost in time.
-//     No order at all is sent on the last batch (the replay would reject it
-//     and flatten the position itself).
-//   - A sell the market refuses (a gap past the slippage cap, a missing bar)
-//     stays pending and is sent again on the next batch; the exit only counts
-//     once its fill is seen, so a refused exit can never strand the position
-//     with its peak reset.
-//   - At most one open position; a buy spends the whole cash balance (the
-//     weight cap is 100% of equity), a sell closes the whole position.
-//
-// Determinism: the decision uses only the closes seen so far, in float64
-// arithmetic (+, -, /, comparisons). No randomness, no wall clock, no
-// environment reads, so two runs on the same bars answer byte for byte alike.
+// Decisions use only the closes seen so far, in exact bigint arithmetic.
+// No randomness, no wall clock, no environment reads: two runs on the same
+// bars produce byte-identical action logs.
 
-import { runBars, type BarsState, type Batch, type BuyInput, type OrderInput, type SellInput } from './vendor/makefun-bars.ts';
+import { runBars } from './vendor/makefun-bars.ts';
+import type { BarsState, Batch, OrderInput } from './vendor/makefun-bars.ts';
 
 const SYMBOL = 'CBBTC';
-// The window is 1,440 one-minute batches; seq counts batches, bars included.
-const WINDOW_BARS = 1440;
-
-// Entry: 60-bar momentum above this, with the 120-bar return above its floor.
-const MOM_BARS = 60;
-const ENTRY_BPS = 40;
-const LONG_BARS = 120;
-const LONG_MIN_BPS = -50;
-// Exit: trailing stop below the peak close since entry, or momentum reversal.
-const TRAIL_BPS = 250;
-const SLOW_EXIT_BPS = -200;
-// Frictions: wait after an exit, hold a minimum time, stop entering near the end.
-const COOLDOWN_BARS = 120;
-const MIN_HOLD_BARS = 15;
-const NO_ENTRY_LAST = 30;
-// Fill guard: the dev window's largest 1-minute move was 72 bps; 150 bps of
-// headroom covers that plus the 2 bps modelled slippage and ~17 bps of impact
-// on a full-size fill, while still refusing a fill into a real dislocation.
+// The window is 1,440 one-minute bars; batches are one per minute, so the
+// last batch is seq warmupBars + 1439.
+const TOTAL_BARS = 1440;
+const NO_ENTRY_TAIL_BARS = 30;
 const MAX_SLIPPAGE_BPS = 150;
+// Minimum cash to bother entering: $1, in quote units (6 decimals).
+const MIN_CASH_UNITS = 1_000_000n;
+// Entry: 20-bar return above +10 bps, 120-bar return above -50 bps.
+const ENTRY_RET20_BPS = 10n;
+const REGIME_RET120_BPS = -50n;
+// Exits, after holding at least 3 bars: 5% trailing stop below the peak
+// close since entry, or the 20-bar return falling below -200 bps.
+const EXIT_RET20_BPS = -200n;
+const TRAIL_BPS = 500n;
+const MIN_HOLD_BARS = 3;
+// Bars to wait after an exit before a new entry may fire.
+const EXIT_COOLDOWN_BARS = 5;
 
-/** The closes seen, the peak since entry, and the bar counts that gate
- * entries and exits. Bar counts count CBBTC bars actually received, so a
- * minute with no bar neither ages a cooldown nor counts as a hold bar. */
-const closes: number[] = [];
-let peak: number | null = null;
-let entryBar = -1e9;
-let lastExitBar = -1e9;
-/** The client_id of a sell that was sent but whose fill has not been seen
- * yet. The exit only counts once the fill lands: a sell the market refuses
- * (a gap past the slippage cap at the next open, a missing bar) is sent
- * again on the next batch instead of silently leaving the position open
- * with its peak reset. */
-let pendingSellId: string | null = null;
+// ---------------------------------------------------------------- state
 
-/** The close's return over the last n bars, in basis points, or null while
- * fewer than n + 1 closes have been seen. */
-function retBps(n: number): number | null {
-  if (closes.length <= n) return null;
-  return (closes[closes.length - 1]! / closes[closes.length - 1 - n]! - 1) * 10000;
+// Every CBBTC close seen so far, oldest first. The bar index of the latest
+// close is closes.length - 1.
+const closes: bigint[] = [];
+// Entry state, meaningful only while long: the close the entry was decided
+// on, the bar index of that decision, and the highest close since entry.
+let entryClose = 0n;
+let entryBar = -1;
+let peakClose = 0n;
+// Bar index of the most recent exit fill; deeply negative until the first.
+let lastExitBar = -1_000_000;
+// A buy decided on the previous batch, awaiting its fill report.
+let pendingBuy: { price: bigint; bar: number } | null = null;
+// A sell has been sent and not yet reported filled; retry until it fills.
+let pendingSell = false;
+
+// Return in bps between the latest close and the close `bars` bars back.
+// Null when not enough closes have been seen yet, or when the reference
+// close is zero (a zero divisor would throw and kill the run).
+function retBps(bars: number): bigint | null {
+  if (closes.length <= bars) return null;
+  const now = closes[closes.length - 1]!;
+  const then = closes[closes.length - 1 - bars]!;
+  if (then === 0n) return null;
+  return ((now - then) * 10_000n) / then;
 }
 
-await runBars({
-  onBatch(state: BarsState, batch: Batch): OrderInput[] {
-    if (state.warmingUp) return [];
-    // An order decided on the last batch is rejected (after_end); the replay
-    // flattens any position at the last close on its own.
-    if (state.seq >= WINDOW_BARS - 1) return [];
-    // Resolve a pending sell from this batch's fills before deciding.
-    let sellFilled = false;
-    if (pendingSellId !== null) {
-      const fill = batch.fills.find((f) => f.client_id === pendingSellId);
-      if (fill !== undefined && fill.status === 'filled') {
-        pendingSellId = null;
-        sellFilled = true;
+function sellAll(state: BarsState): OrderInput[] {
+  const qty = state.positions.get(SYMBOL)?.qty ?? 0n;
+  if (qty <= 0n) return [];
+  pendingSell = true;
+  return [{ side: 'sell', symbol: SYMBOL, qty, max_slippage_bps: MAX_SLIPPAGE_BPS }];
+}
+
+async function onBatch(state: BarsState, batch: Batch): Promise<OrderInput[]> {
+  // Fold in this batch's fresh bar, if CBBTC traded this minute.
+  const bar = batch.bars.find((b) => b.symbol === SYMBOL);
+  const freshBar = bar !== undefined;
+  if (freshBar) closes.push(BigInt(bar.c));
+  const barIndex = closes.length - 1;
+  const latestClose = closes.length > 0 ? closes[closes.length - 1]! : null;
+
+  // Settle the previous batch's orders from their fill reports.
+  for (const fill of batch.fills) {
+    if (fill.symbol !== SYMBOL) continue;
+    if (fill.side === 'buy') {
+      if (fill.status === 'filled' && pendingBuy !== null) {
+        entryClose = pendingBuy.price;
+        entryBar = pendingBuy.bar;
+        peakClose = pendingBuy.price;
       }
+      pendingBuy = null;
+    } else if (fill.side === 'sell' && fill.status === 'filled') {
+      pendingSell = false;
+      lastExitBar = barIndex;
     }
-    const bar = batch.bars.find((b) => b.symbol === SYMBOL);
-    if (bar === undefined) {
-      // No bar for our symbol this minute: nothing new to decide on — except
-      // a refused sell, which is retried even without a new close.
-      if (pendingSellId !== null) {
-        const held = state.positions.get(SYMBOL);
-        if (held !== undefined) {
-          pendingSellId = `x${state.seq}`;
-          const retry: SellInput = { side: 'sell', symbol: SYMBOL, qty: held.qty, max_slippage_bps: MAX_SLIPPAGE_BPS, client_id: pendingSellId };
-          return [retry];
-        }
-      }
-      return [];
+  }
+
+  // Position is whatever the account reports, never an assumption.
+  const qty = state.positions.get(SYMBOL)?.qty ?? 0n;
+  if (qty === 0n) {
+    pendingSell = false;
+    if (pendingBuy === null) {
+      entryClose = 0n;
+      entryBar = -1;
+      peakClose = 0n;
     }
-    const close = Number(bar.c);
-    closes.push(close);
-    const barNo = closes.length - 1;
-    if (sellFilled) {
-      // The exit closed at this bar's open: the cooldown counts from here.
-      lastExitBar = barNo;
-      peak = null;
-    }
-    const held = state.positions.get(SYMBOL);
-    if (held !== undefined) {
-      if (peak === null || close > peak) peak = close;
-      if (pendingSellId !== null) {
-        // The last sell was refused; send it again with a fresh id.
-        pendingSellId = `x${state.seq}`;
-        const retry: SellInput = { side: 'sell', symbol: SYMBOL, qty: held.qty, max_slippage_bps: MAX_SLIPPAGE_BPS, client_id: pendingSellId };
-        return [retry];
-      }
-      if (barNo - entryBar >= MIN_HOLD_BARS) {
-        const trailHit = close < peak * (1 - TRAIL_BPS / 10000);
-        const mom = retBps(MOM_BARS);
-        const reversal = mom !== null && mom < SLOW_EXIT_BPS;
-        if (trailHit || reversal) {
-          // The peak and the cooldown are only reset when the fill is seen
-          // (above); until then this sell stays pending.
-          pendingSellId = `x${state.seq}`;
-          const sell: SellInput = { side: 'sell', symbol: SYMBOL, qty: held.qty, max_slippage_bps: MAX_SLIPPAGE_BPS, client_id: pendingSellId };
-          return [sell];
-        }
-      }
-      return [];
-    }
-    // Flat: look for an entry.
-    if (state.seq >= WINDOW_BARS - NO_ENTRY_LAST) return [];
-    if (barNo - lastExitBar < COOLDOWN_BARS) return [];
-    const mom = retBps(MOM_BARS);
-    if (mom === null || mom <= ENTRY_BPS) return [];
-    const longMom = retBps(LONG_BARS);
-    if (longMom !== null && longMom <= LONG_MIN_BPS) return [];
-    const room = state.weightRoom(SYMBOL);
-    const notional = state.cash < room ? state.cash : room;
-    if (notional < BigInt(state.hello.fees.min_notional_quote_units)) return [];
-    entryBar = barNo;
-    peak = close;
-    const buy: BuyInput = { side: 'buy', symbol: SYMBOL, notional_quote_units: notional, max_slippage_bps: MAX_SLIPPAGE_BPS };
-    return [buy];
-  },
-});
+  }
+
+  // No orders on a warm-up batch, on a batch with no fresh bar, or on the
+  // last batch (the harness rejects those; the position auto-flattens).
+  const firstScoredSeq = state.warmupBars;
+  const lastSeq = firstScoredSeq + TOTAL_BARS - 1;
+  if (state.warmingUp || !freshBar || latestClose === null || state.seq >= lastSeq) return [];
+
+  // A refused sell is retried on every following batch until it fills;
+  // never buy while a sell is pending.
+  if (pendingSell) return sellAll(state);
+
+  if (qty > 0n) {
+    // Long: track the peak, then check the exits once the minimum hold
+    // has passed.
+    if (latestClose > peakClose) peakClose = latestClose;
+    if (barIndex - entryBar < MIN_HOLD_BARS) return [];
+    const trailingStop = latestClose * 10_000n < peakClose * (10_000n - TRAIL_BPS);
+    const ret20 = retBps(20);
+    const reversal = ret20 !== null && ret20 < EXIT_RET20_BPS;
+    if (trailingStop || reversal) return sellAll(state);
+    return [];
+  }
+
+  // Flat: wait for a pending buy's fill report before deciding anything.
+  if (pendingBuy !== null) return [];
+
+  // Entry: fast momentum up, regime not falling, cooled down after the
+  // last exit, not in the last 30 bars, and at least $1 of cash.
+  const ret20 = retBps(20);
+  if (ret20 === null || ret20 <= ENTRY_RET20_BPS) return [];
+  const ret120 = retBps(120);
+  if (ret120 !== null && ret120 <= REGIME_RET120_BPS) return [];
+  if (barIndex - lastExitBar < EXIT_COOLDOWN_BARS) return [];
+  if (state.seq >= firstScoredSeq + TOTAL_BARS - NO_ENTRY_TAIL_BARS) return [];
+  if (state.cash < MIN_CASH_UNITS) return [];
+
+  pendingBuy = { price: latestClose, bar: barIndex };
+  return [{ side: 'buy', symbol: SYMBOL, notional_quote_units: state.cash, max_slippage_bps: MAX_SLIPPAGE_BPS }];
+}
+
+await runBars({ onBatch });
