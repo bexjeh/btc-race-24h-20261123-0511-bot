@@ -18,6 +18,12 @@
 //     bar cannot flip the bot out right after entry.
 //   - No new entries in the last 30 batches of the 1440-bar window: a trade
 //     opened there cannot earn back its ~34 bps round-trip cost in time.
+//     No order at all is sent on the last batch (the replay would reject it
+//     and flatten the position itself).
+//   - A sell the market refuses (a gap past the slippage cap, a missing bar)
+//     stays pending and is sent again on the next batch; the exit only counts
+//     once its fill is seen, so a refused exit can never strand the position
+//     with its peak reset.
 //   - At most one open position; a buy spends the whole cash balance (the
 //     weight cap is 100% of equity), a sell closes the whole position.
 //
@@ -55,6 +61,12 @@ const closes: number[] = [];
 let peak: number | null = null;
 let entryBar = -1e9;
 let lastExitBar = -1e9;
+/** The client_id of a sell that was sent but whose fill has not been seen
+ * yet. The exit only counts once the fill lands: a sell the market refuses
+ * (a gap past the slippage cap at the next open, a missing bar) is sent
+ * again on the next batch instead of silently leaving the position open
+ * with its peak reset. */
+let pendingSellId: string | null = null;
 
 /** The close's return over the last n bars, in basis points, or null while
  * fewer than n + 1 closes have been seen. */
@@ -66,25 +78,58 @@ function retBps(n: number): number | null {
 await runBars({
   onBatch(state: BarsState, batch: Batch): OrderInput[] {
     if (state.warmingUp) return [];
+    // An order decided on the last batch is rejected (after_end); the replay
+    // flattens any position at the last close on its own.
+    if (state.seq >= WINDOW_BARS - 1) return [];
+    // Resolve a pending sell from this batch's fills before deciding.
+    let sellFilled = false;
+    if (pendingSellId !== null) {
+      const fill = batch.fills.find((f) => f.client_id === pendingSellId);
+      if (fill !== undefined && fill.status === 'filled') {
+        pendingSellId = null;
+        sellFilled = true;
+      }
+    }
     const bar = batch.bars.find((b) => b.symbol === SYMBOL);
     if (bar === undefined) {
-      // No bar for our symbol this minute: nothing new to decide on.
+      // No bar for our symbol this minute: nothing new to decide on — except
+      // a refused sell, which is retried even without a new close.
+      if (pendingSellId !== null) {
+        const held = state.positions.get(SYMBOL);
+        if (held !== undefined) {
+          pendingSellId = `x${state.seq}`;
+          const retry: SellInput = { side: 'sell', symbol: SYMBOL, qty: held.qty, max_slippage_bps: MAX_SLIPPAGE_BPS, client_id: pendingSellId };
+          return [retry];
+        }
+      }
       return [];
     }
     const close = Number(bar.c);
     closes.push(close);
     const barNo = closes.length - 1;
+    if (sellFilled) {
+      // The exit closed at this bar's open: the cooldown counts from here.
+      lastExitBar = barNo;
+      peak = null;
+    }
     const held = state.positions.get(SYMBOL);
     if (held !== undefined) {
       if (peak === null || close > peak) peak = close;
+      if (pendingSellId !== null) {
+        // The last sell was refused; send it again with a fresh id.
+        pendingSellId = `x${state.seq}`;
+        const retry: SellInput = { side: 'sell', symbol: SYMBOL, qty: held.qty, max_slippage_bps: MAX_SLIPPAGE_BPS, client_id: pendingSellId };
+        return [retry];
+      }
       if (barNo - entryBar >= MIN_HOLD_BARS) {
         const trailHit = close < peak * (1 - TRAIL_BPS / 10000);
         const mom = retBps(MOM_BARS);
         const reversal = mom !== null && mom < SLOW_EXIT_BPS;
         if (trailHit || reversal) {
-          lastExitBar = barNo;
-          peak = null;
-          const sell: SellInput = { side: 'sell', symbol: SYMBOL, qty: held.qty, max_slippage_bps: MAX_SLIPPAGE_BPS };
+          // The peak and the cooldown are only reset when the fill is seen
+          // (above); until then this sell stays pending.
+          pendingSellId = `x${state.seq}`;
+          const sell: SellInput = { side: 'sell', symbol: SYMBOL, qty: held.qty, max_slippage_bps: MAX_SLIPPAGE_BPS, client_id: pendingSellId };
           return [sell];
         }
       }
