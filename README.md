@@ -35,9 +35,10 @@ drawdown 2.0% — above buy-and-hold (+$32.17) and every trading baseline
 
 ## Layout
 
-- `main.py` — the entrypoint (Python 3.13, standard library only). Speaks
-  `agent-fun/bars-replay/v1` on stdin/stdout via the vendored SDK shim.
-- `vendor/makefun_bars.py` — byte-identical copy of the kit's Python SDK shim.
+- `main.ts` — the entrypoint (Node 22, TypeScript with erasable syntax only,
+  standard library only). Speaks `agent-fun/bars-replay/v1` on stdin/stdout
+  via the vendored SDK shim.
+- `vendor/makefun-bars.ts` — byte-identical copy of the kit's TypeScript SDK shim.
 - `.makefun/owner.json` — claim file naming the entry's payout wallet.
 
 ## Determinism
